@@ -69,6 +69,12 @@ type SessionStartOptions struct {
 	// DoltBranch is the polecat-specific Dolt branch for write isolation.
 	// If set, BD_BRANCH env var is injected into the polecat session.
 	DoltBranch string
+
+	// AgentOverride is the agent alias override (e.g., "opencode", "gemini").
+	// When set, EnsureSettingsForRole uses ResolveAgentConfigWithOverride
+	// instead of the default role-based resolution, ensuring the correct
+	// runtime (plugins, settings) is provisioned for the overridden agent.
+	AgentOverride string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -182,11 +188,22 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		}
 	}
 
-	// Use ResolveRoleAgentConfig instead of deprecated LoadRuntimeConfig to properly
-	// resolve role_agents from town settings. This ensures EnsureSettingsForRole
-	// creates the correct settings/plugin for the configured agent (e.g., opencode).
+	// Resolve runtime config, using agent override if specified.
+	// This ensures EnsureSettingsForRole provisions the correct runtime
+	// (e.g., opencode plugin instead of claude settings) when --agent is used.
 	townRoot := filepath.Dir(m.rig.Path)
-	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+	var runtimeConfig *config.RuntimeConfig
+	if opts.AgentOverride != "" {
+		rc, _, resolveErr := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, opts.AgentOverride)
+		if resolveErr != nil {
+			// Fall back to default rather than failing - session can still work
+			runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+		} else {
+			runtimeConfig = rc
+		}
+	} else {
+		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+	}
 
 	// Ensure runtime settings exist in polecat's home directory (polecats/<name>/).
 	// This keeps settings out of the git worktree while allowing runtime to find them
@@ -195,6 +212,13 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	polecatHomeDir := m.polecatDir(polecat)
 	if err := runtime.EnsureSettingsForRole(polecatHomeDir, "polecat", runtimeConfig); err != nil {
 		return fmt.Errorf("ensuring runtime settings: %w", err)
+	}
+
+	// Provision MCP config for non-claude agents (e.g., opencode).
+	// Looks for a rig-level template at polecats/opencode-polecat.json and copies
+	// it to the polecat's worktree as opencode.json so the agent gets MCP tools.
+	if opts.AgentOverride != "" {
+		m.provisionMCPConfig(polecat, opts.AgentOverride)
 	}
 
 	// Get fallback info to determine beacon content based on agent capabilities.
@@ -588,6 +612,47 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 		return fmt.Errorf("%w: %s is tombstoned", ErrIssueInvalid, issueID)
 	}
 	return nil
+}
+
+// provisionMCPConfig copies a rig-level MCP config template to the polecat's worktree.
+// For opencode agents, looks for polecats/opencode-polecat.json in the rig and copies
+// it to the polecat's clone path as opencode.json, giving the polecat MCP tool access.
+// For claude agents, looks for polecats/.mcp-polecat.json and copies as .mcp.json.
+// This is best-effort (non-fatal) since the agent can still function without MCP tools.
+func (m *SessionManager) provisionMCPConfig(polecat, agent string) {
+	clonePath := m.clonePath(polecat)
+	polecatsDir := filepath.Join(m.rig.Path, "polecats")
+
+	switch agent {
+	case "opencode":
+		src := filepath.Join(polecatsDir, "opencode-polecat.json")
+		dst := filepath.Join(clonePath, "opencode.json")
+		if err := copyFileIfExists(src, dst); err != nil {
+			fmt.Printf("Warning: could not provision opencode MCP config: %v\n", err)
+		}
+	default:
+		src := filepath.Join(polecatsDir, ".mcp-polecat.json")
+		dst := filepath.Join(clonePath, ".mcp.json")
+		if err := copyFileIfExists(src, dst); err != nil {
+			fmt.Printf("Warning: could not provision claude MCP config: %v\n", err)
+		}
+	}
+}
+
+// copyFileIfExists copies src to dst if src exists. Skips silently if src doesn't exist.
+func copyFileIfExists(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No template - skip silently
+		}
+		return err
+	}
+	// Don't overwrite existing config (polecat may have been respawned)
+	if _, err := os.Stat(dst); err == nil {
+		return nil
+	}
+	return os.WriteFile(dst, data, 0644)
 }
 
 // hookIssue pins an issue to a polecat's hook using bd update.
